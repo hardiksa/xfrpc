@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.5)
 
 project(xfrp C)
 
@@ -24,6 +24,13 @@ else()
 
 	find_package(JSON-C REQUIRED)
 	include_directories(${JSON-C_INCLUDE_DIR})
+	include_directories(${LIBEVENT_INCLUDE_DIR})
+	include_directories(${OPENSSL_INCLUDE_DIR})
+
+	# Get library directories from found paths
+	get_filename_component(OPENSSL_LIB_DIR "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+	get_filename_component(LIBEVENT_LIB_DIR "${LIBEVENT_LIB}" DIRECTORY)
+	link_directories(${OPENSSL_LIB_DIR} ${LIBEVENT_LIB_DIR})
 endif(THIRDPARTY_STATIC_BUILD)
 
 macro(check_asan _RESULT)
@@ -93,11 +100,15 @@ set(libs
 	ssl
 	crypto
 	event
+	event_openssl
 	z
 	m
 	json-c
-	crypt
 	pthread)
+
+if(NOT APPLE)
+	list(APPEND libs crypt)
+endif()
 	
 set(test_libs
 	event

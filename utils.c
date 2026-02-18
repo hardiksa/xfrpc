@@ -15,7 +15,12 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <ifaddrs.h>
+#ifdef __linux__
 #include <linux/if_link.h>
+#endif
+#ifdef __APPLE__
+#include <net/if_dl.h>
+#endif
 
 #include "utils.h"
 
@@ -42,15 +47,34 @@ int is_valid_ip_address(const char *ip_address)
 //	net_if_name: name of network interface, e.g. br-lan
 //	return: 1: error 0:get succeed
 int get_net_mac(char *net_if_name, char *mac, int mac_len) {
+	if (mac_len < 12 || net_if_name == NULL) {
+		return 1;
+	}
+#ifdef __APPLE__
+	struct ifaddrs *ifaddr, *ifa;
+	if (getifaddrs(&ifaddr) == -1)
+		return 1;
+	int ret = 1;
+	for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL) continue;
+		if (ifa->ifa_addr->sa_family == AF_LINK && strcmp(ifa->ifa_name, net_if_name) == 0) {
+			struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+			unsigned char *ptr = (unsigned char *)LLADDR(sdl);
+			for (int i = 0; i < 6; i++)
+				snprintf(mac + 2*i, mac_len - 2*i, "%02X", ptr[i]);
+			mac[12] = 0;
+			ret = 0;
+			break;
+		}
+	}
+	freeifaddrs(ifaddr);
+	return ret;
+#else
 	int ret = 1;
 	int i = 0;
 	int sock = 0;
 
-	if (mac_len < 12 || net_if_name == NULL) {
-		return 1;
-	}
 	struct ifreq ifreq;
-
 	sock = socket(AF_INET, SOCK_STREAM, 0);
 	if( sock < 0 ) {
 		perror("error sock");
@@ -64,7 +88,7 @@ int get_net_mac(char *net_if_name, char *mac, int mac_len) {
 	}
 
 	for( i = 0; i < 6; i++ ){
-		snprintf(mac+2*i, mac_len - 2*i, "%02X", 
+		snprintf(mac+2*i, mac_len - 2*i, "%02X",
 			(unsigned char)ifreq.ifr_hwaddr.sa_data[i]);
 	}
 	mac[strlen(mac)] = 0;
@@ -73,6 +97,7 @@ int get_net_mac(char *net_if_name, char *mac, int mac_len) {
 OUT:
 	close(sock);
 	return ret;
+#endif
 }
 
 // return: -1: network interface check failed; other: ifname numbers 
@@ -100,7 +125,9 @@ int show_net_ifname()
 		 
 		printf("%-8s %s (%d)\n",
 		      ifa->ifa_name,
+#ifdef AF_PACKET
 		      (family == AF_PACKET) ? "AF_PACKET" :
+#endif
 		      (family == AF_INET) ? "AF_INET" :
 		      (family == AF_INET6) ? "AF_INET6" : "???",
 		      family);
@@ -120,6 +147,7 @@ int show_net_ifname()
 
 	       printf("\t\taddress: <%s>\n", host);
 
+#ifdef AF_PACKET
 	   } else if (family == AF_PACKET && ifa->ifa_data != NULL) {
 	       struct rtnl_link_stats *stats = (struct rtnl_link_stats *)ifa->ifa_data;
 
@@ -127,6 +155,7 @@ int show_net_ifname()
 	              "\t\ttx_bytes   = %10u; rx_bytes   = %10u\n",
 	              stats->tx_packets, stats->rx_packets,
 	              stats->tx_bytes, stats->rx_bytes);
+#endif
 	   }
 	}
 
@@ -163,12 +192,18 @@ int get_net_ifname(char *if_buf, int blen)
 				found = 1;
 				break;
 			}
-		} else if (family == AF_PACKET && 
-			ifa->ifa_data != NULL && 
+			// fallback: pick first non-loopback AF_INET interface
+			if (tmp_if_buf[0] == 0 && strcmp(ifa->ifa_name, "lo") != 0 && strcmp(ifa->ifa_name, "lo0") != 0) {
+				strncpy(tmp_if_buf, ifa->ifa_name, 16);
+			}
+		}
+#ifdef AF_PACKET
+		else if (family == AF_PACKET &&
+			ifa->ifa_data != NULL &&
 			strcmp(ifa->ifa_name, "lo") != 0) { // skip local loop interface
-			
 			strncpy(tmp_if_buf, ifa->ifa_name, 16);
 		}
+#endif
 	}
 
 	if (found) {

@@ -50,6 +50,12 @@ struct common_conf {
 	int		heartbeat_timeout;	/* default 30 */
 	int 	tcp_mux;		/* default 0 */
 
+	/* tls/mtls fields */
+	int		tls_enable;			/* default 0 */
+	char	*tls_cert_file;		/* client certificate for mTLS */
+	char	*tls_key_file;		/* client private key for mTLS */
+	char	*tls_trusted_ca_file;	/* CA cert to verify server */
+
 	/* private fields */
 	int 	is_router;	// to sign router (Openwrt/LEDE) or not
 };

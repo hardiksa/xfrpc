@@ -31,8 +31,10 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <pwd.h>
+#ifndef __APPLE__
 #include <shadow.h>
 #include <crypt.h>
+#endif
 
 #include "ini.h"
 #include "uthash.h"
@@ -72,6 +74,9 @@ free_common_config()
 
 	if (c_conf->server_addr) free(c_conf->server_addr);
 	if (c_conf->auth_token) free(c_conf->auth_token);
+	if (c_conf->tls_cert_file) free(c_conf->tls_cert_file);
+	if (c_conf->tls_key_file) free(c_conf->tls_key_file);
+	if (c_conf->tls_trusted_ca_file) free(c_conf->tls_trusted_ca_file);
 };
 
 static int 
@@ -108,9 +113,9 @@ dump_common_conf()
 		return;
 	}
 
-	debug(LOG_DEBUG, "Section[common]: {server_addr:%s, server_port:%d, auth_token:%s, interval:%d, timeout:%d}",
-			 c_conf->server_addr, c_conf->server_port, c_conf->auth_token, 
-			 c_conf->heartbeat_interval, c_conf->heartbeat_timeout);
+	debug(LOG_DEBUG, "Section[common]: {server_addr:%s, server_port:%d, auth_token:%s, interval:%d, timeout:%d, tls_enable:%d}",
+			 c_conf->server_addr, c_conf->server_port, c_conf->auth_token,
+			 c_conf->heartbeat_interval, c_conf->heartbeat_timeout, c_conf->tls_enable);
 }
 
 static void 
@@ -475,6 +480,20 @@ common_handler(void *user, const char *section, const char *name, const char *va
 	} else if (MATCH("common", "tcp_mux")) {
 		config->tcp_mux = atoi(value);
 		config->tcp_mux = !!config->tcp_mux;
+	} else if (MATCH("common", "tls_enable")) {
+		config->tls_enable = is_true(value);
+	} else if (MATCH("common", "tls_cert_file")) {
+		SAFE_FREE(config->tls_cert_file);
+		config->tls_cert_file = strdup(value);
+		assert(config->tls_cert_file);
+	} else if (MATCH("common", "tls_key_file")) {
+		SAFE_FREE(config->tls_key_file);
+		config->tls_key_file = strdup(value);
+		assert(config->tls_key_file);
+	} else if (MATCH("common", "tls_trusted_ca_file")) {
+		SAFE_FREE(config->tls_trusted_ca_file);
+		config->tls_trusted_ca_file = strdup(value);
+		assert(config->tls_trusted_ca_file);
 	}
 	return 1;
 }
@@ -491,6 +510,10 @@ init_common_conf(struct common_conf *config)
 	config->heartbeat_interval 	= 30;
 	config->heartbeat_timeout	= 90;
 	config->tcp_mux				= 1;
+	config->tls_enable			= 0;
+	config->tls_cert_file		= NULL;
+	config->tls_key_file		= NULL;
+	config->tls_trusted_ca_file	= NULL;
 	config->is_router			= 0;
 }
 

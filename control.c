@@ -37,6 +37,10 @@
 #include <unistd.h>
 #include <time.h>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <event2/bufferevent_ssl.h>
+
 #include "debug.h"
 #include "client.h"
 #include "uthash.h"
@@ -55,12 +59,75 @@ static struct control *main_ctl;
 static int client_connected = 0;
 static int is_login = 0;
 static time_t pong_time = 0;
+static SSL_CTX *ssl_ctx = NULL;
 
 static void new_work_connection(struct bufferevent *bev, struct tmux_stream *stream);
 static void recv_cb(struct bufferevent *bev, void *ctx);
 static void clear_main_control();
 static void start_base_connect();
 static void keep_control_alive();
+static struct bufferevent *upgrade_to_tls(struct bufferevent *plain_bev, struct event_base *base);
+
+static SSL_CTX *
+init_ssl_ctx()
+{
+	struct common_conf *c_conf = get_common_config();
+	if (!c_conf->tls_enable)
+		return NULL;
+
+	SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+	if (!ctx) {
+		debug(LOG_ERR, "Failed to create SSL_CTX");
+		return NULL;
+	}
+
+	SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+	if (c_conf->tls_trusted_ca_file) {
+		if (SSL_CTX_load_verify_locations(ctx, c_conf->tls_trusted_ca_file, NULL) != 1) {
+			debug(LOG_ERR, "Failed to load CA file: %s", c_conf->tls_trusted_ca_file);
+			SSL_CTX_free(ctx);
+			return NULL;
+		}
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+		debug(LOG_INFO, "TLS: loaded CA cert %s", c_conf->tls_trusted_ca_file);
+	}
+
+	if (c_conf->tls_cert_file) {
+		if (SSL_CTX_use_certificate_file(ctx, c_conf->tls_cert_file, SSL_FILETYPE_PEM) != 1) {
+			debug(LOG_ERR, "Failed to load client cert: %s", c_conf->tls_cert_file);
+			SSL_CTX_free(ctx);
+			return NULL;
+		}
+		debug(LOG_INFO, "TLS: loaded client cert %s", c_conf->tls_cert_file);
+	}
+
+	if (c_conf->tls_key_file) {
+		if (SSL_CTX_use_PrivateKey_file(ctx, c_conf->tls_key_file, SSL_FILETYPE_PEM) != 1) {
+			debug(LOG_ERR, "Failed to load client key: %s", c_conf->tls_key_file);
+			SSL_CTX_free(ctx);
+			return NULL;
+		}
+		if (SSL_CTX_check_private_key(ctx) != 1) {
+			debug(LOG_ERR, "Client cert and key mismatch");
+			SSL_CTX_free(ctx);
+			return NULL;
+		}
+		debug(LOG_INFO, "TLS: loaded client key %s", c_conf->tls_key_file);
+	}
+
+	debug(LOG_INFO, "TLS: SSL context initialized for mTLS");
+	return ctx;
+}
+
+static void
+free_ssl_ctx()
+{
+	if (ssl_ctx) {
+		SSL_CTX_free(ssl_ctx);
+		ssl_ctx = NULL;
+	}
+}
 
 static int 
 is_client_connected()
@@ -91,7 +158,28 @@ set_client_work_start(struct proxy_client *client, int is_start_work)
 	return client->work_started;
 }
 
-static void 
+static void
+client_tls_event_cb(struct bufferevent *bev, short what, void *ctx)
+{
+	struct proxy_client *client = ctx;
+	assert(client);
+	struct common_conf *c_conf = get_common_config();
+
+	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
+		debug(LOG_ERR, "TLS: work conn handshake error: %s", strerror(errno));
+		bufferevent_free(bev);
+		del_proxy_client_by_stream_id(client->stream_id);
+	} else if (what & BEV_EVENT_CONNECTED) {
+		debug(LOG_INFO, "TLS: work conn mTLS handshake done");
+		bufferevent_setcb(bev, recv_cb, NULL, client_tls_event_cb, client);
+		bufferevent_enable(bev, EV_READ|EV_WRITE);
+		new_work_connection(bev, &main_ctl->stream);
+		set_client_status(1);
+		debug(LOG_INFO, "proxy service start");
+	}
+}
+
+static void
 client_start_event_cb(struct bufferevent *bev, short what, void *ctx)
 {
 	struct proxy_client *client = ctx;
@@ -108,6 +196,22 @@ client_start_event_cb(struct bufferevent *bev, short what, void *ctx)
 		bufferevent_free(bev);
 		del_proxy_client_by_stream_id(client->stream_id);
 	} else if (what & BEV_EVENT_CONNECTED) {
+		if (c_conf->tls_enable && ssl_ctx) {
+			uint8_t tls_marker = 0x17;
+			evutil_socket_t fd = bufferevent_getfd(bev);
+			send(fd, &tls_marker, 1, 0);
+
+			struct bufferevent *tls_bev = upgrade_to_tls(bev, client->base);
+			if (!tls_bev) {
+				debug(LOG_ERR, "TLS: work conn upgrade failed");
+				del_proxy_client_by_stream_id(client->stream_id);
+				return;
+			}
+			client->ctl_bev = tls_bev;
+			bufferevent_enable(tls_bev, EV_READ|EV_WRITE);
+			bufferevent_setcb(tls_bev, recv_cb, NULL, client_tls_event_cb, client);
+			return;
+		}
 		bufferevent_setcb(bev, recv_cb, NULL, client_start_event_cb, client);
 		bufferevent_enable(bev, EV_READ|EV_WRITE);
 		new_work_connection(bev, &main_ctl->stream);
@@ -211,13 +315,51 @@ new_work_connection(struct bufferevent *bev, struct tmux_stream *stream)
 	SAFE_FREE(work_c);
 }
 
+static struct bufferevent *
+upgrade_to_tls(struct bufferevent *plain_bev, struct event_base *base)
+{
+	if (!ssl_ctx) return NULL;
+
+	evutil_socket_t fd = bufferevent_getfd(plain_bev);
+	if (fd < 0) {
+		debug(LOG_ERR, "TLS: cannot get fd from bufferevent");
+		return NULL;
+	}
+
+	/* Detach fd from plain bev so it won't be closed */
+	bufferevent_setfd(plain_bev, -1);
+	bufferevent_free(plain_bev);
+
+	SSL *ssl = SSL_new(ssl_ctx);
+	if (!ssl) {
+		debug(LOG_ERR, "TLS: SSL_new failed");
+		close(fd);
+		return NULL;
+	}
+
+	struct bufferevent *tls_bev = bufferevent_openssl_socket_new(
+		base, fd, ssl,
+		BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	if (!tls_bev) {
+		debug(LOG_ERR, "TLS: bufferevent_openssl_socket_new failed");
+		SSL_free(ssl);
+		close(fd);
+		return NULL;
+	}
+	bufferevent_openssl_set_allow_dirty_shutdown(tls_bev, 1);
+
+	debug(LOG_INFO, "TLS: upgrading connection to mTLS");
+	return tls_bev;
+}
+
 struct bufferevent *
 connect_server(struct event_base *base, const char *name, const int port)
 {
 	struct bufferevent *bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
 	assert(bev);
 
-	if (bufferevent_socket_connect_hostname(bev, main_ctl->dnsbase, 
+	if (bufferevent_socket_connect_hostname(bev, main_ctl->dnsbase,
 											AF_INET, name, port) < 0 ) {
 		bufferevent_free(bev);
 		return NULL;
@@ -638,21 +780,45 @@ recv_cb(struct bufferevent *bev, void *ctx)
 	return;
 }
 
-static void 
+static void
+tls_event_cb(struct bufferevent *bev, short what, void *ctx)
+{
+	struct common_conf *c_conf = get_common_config();
+	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
+		unsigned long ssl_err = bufferevent_get_openssl_error(bev);
+		debug(LOG_ERR, "TLS: handshake error: %s (ssl_err=%lu)",
+				strerror(errno), ssl_err);
+		if (ssl_err)
+			debug(LOG_ERR, "TLS: %s", ERR_reason_error_string(ssl_err));
+		reset_session_id();
+		clear_main_control();
+		run_control();
+	} else if (what & BEV_EVENT_CONNECTED) {
+		debug(LOG_INFO, "TLS: mTLS handshake completed successfully");
+		/* Now proceed with frp protocol */
+		bufferevent_setcb(bev, recv_cb, NULL, tls_event_cb, NULL);
+		bufferevent_enable(bev, EV_READ|EV_WRITE);
+		send_window_update(bev, &main_ctl->stream, 0);
+		login();
+		keep_control_alive();
+	}
+}
+
+static void
 connect_event_cb (struct bufferevent *bev, short what, void *ctx)
 {
 	struct common_conf 	*c_conf = get_common_config();
 	static int retry_times = 1;
 	if (what & (BEV_EVENT_EOF|BEV_EVENT_ERROR)) {
 		if (retry_times >= 100) {
-			debug(LOG_INFO, 
-				"have retry connect to xfrp server for %d times, exit?", 
+			debug(LOG_INFO,
+				"have retry connect to xfrp server for %d times, exit?",
 				retry_times);
 		}
 		sleep(2);
 		retry_times++;
-		debug(LOG_ERR, "error: connect server [%s:%d] failed %s", 
-				c_conf->server_addr, 
+		debug(LOG_ERR, "error: connect server [%s:%d] failed %s",
+				c_conf->server_addr,
 				c_conf->server_port,
 				strerror(errno));
 		reset_session_id();
@@ -661,9 +827,32 @@ connect_event_cb (struct bufferevent *bev, short what, void *ctx)
 	} else if (what & BEV_EVENT_CONNECTED) {
 		debug(LOG_DEBUG, "xfrp server connected");
 		retry_times = 0;
+
+		if (c_conf->tls_enable && ssl_ctx) {
+			/* Send frp TLS first-byte marker 0x17 */
+			uint8_t tls_marker = 0x17;
+			evutil_socket_t fd = bufferevent_getfd(bev);
+			send(fd, &tls_marker, 1, 0);
+			debug(LOG_INFO, "TLS: sent 0x17 first-byte marker");
+
+			/* Upgrade to TLS */
+			struct bufferevent *tls_bev = upgrade_to_tls(bev, main_ctl->connect_base);
+			if (!tls_bev) {
+				debug(LOG_ERR, "TLS: upgrade failed");
+				reset_session_id();
+				clear_main_control();
+				run_control();
+				return;
+			}
+			main_ctl->connect_bev = tls_bev;
+			bufferevent_enable(tls_bev, EV_READ|EV_WRITE);
+			bufferevent_setcb(tls_bev, recv_cb, NULL, tls_event_cb, NULL);
+			return;
+		}
+
 		send_window_update(bev, &main_ctl->stream, 0);
 		login();
-		
+
 		keep_control_alive();
 	}
 }
@@ -840,7 +1029,7 @@ send_new_proxy(struct proxy_service *ps)
 	SAFE_FREE(new_proxy_msg);
 }
 
-void 
+void
 init_main_control()
 {
 	if (main_ctl && main_ctl->connect_base) {
@@ -852,6 +1041,14 @@ init_main_control()
 	assert(main_ctl);
 
 	struct common_conf *c_conf = get_common_config();
+
+	if (c_conf->tls_enable && !ssl_ctx) {
+		ssl_ctx = init_ssl_ctx();
+		if (!ssl_ctx) {
+			debug(LOG_ERR, "TLS: failed to init SSL context, exiting");
+			exit(1);
+		}
+	}
 	struct event_base *base = NULL;
 	struct evdns_base *dnsbase = NULL; 
 	base = event_base_new();
@@ -909,7 +1106,7 @@ clear_main_control()
 		init_tmux_stream(&main_ctl->stream, get_next_session_id(), INIT);
 }
 
-void 
+void
 close_main_control()
 {
 	clear_main_control();
@@ -918,6 +1115,7 @@ close_main_control()
 	evdns_base_free(main_ctl->dnsbase, 0);
 	event_base_free(main_ctl->connect_base);
 
+	free_ssl_ctx();
 	free_main_control();
 }
 

@@ -326,7 +326,11 @@ make_new_session(int sockfd)
 
 		tcgetattr(0, &termbuf);
 		termbuf.c_lflag |= ECHO; /* if we use readline we dont want this */
+#ifdef XTABS
 		termbuf.c_oflag |= ONLCR | XTABS;
+#else
+		termbuf.c_oflag |= ONLCR;
+#endif
 		termbuf.c_iflag |= ICRNL;
 		termbuf.c_iflag &= ~IXOFF;
 		/*termbuf.c_lflag &= ~ICANON;*/
