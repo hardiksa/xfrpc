@@ -45,3 +45,13 @@ xfrp_test_server
 bin
 .vscode
 build
+build_arm*
+
+# Private keys and certificates
+certs/
+*.key
+*.csr
+*.srl
+
+# Test configs with credentials
+test_*.ini
